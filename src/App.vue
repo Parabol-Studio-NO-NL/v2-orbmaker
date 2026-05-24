@@ -28,6 +28,9 @@ const {
   setGradientStopColor,
   randomizeGradient,
   exportAs,
+  setRenderMode,
+  shapeDefinition,
+  shapeLoadError,
 } = useMesh()
 
 function onExport(mode: ExportMode, size: number) {
@@ -82,8 +85,10 @@ function onBackdropClick() {
         :selected-point="selectedPoint"
         :is-rendering="isRendering"
         :gradient-randomize="gradientRandomize"
+        :shape-load-error="shapeLoadError"
         @randomize="randomize"
         @reset="reset"
+        @update:render-mode="setRenderMode"
         @update:cols="config.cols = $event"
         @update:rows="config.rows = $event"
         @update:noiseScale="config.noiseScale = $event"
@@ -120,6 +125,7 @@ function onBackdropClick() {
             :config="config"
             :selected-point="selectedPoint"
             :render-version="renderVersion"
+            :shape-definition="shapeDefinition"
             @point-click="selectPoint"
             @point-color-change="setPointColor"
           />

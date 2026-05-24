@@ -1,4 +1,4 @@
-import type { GradientMapConfig, MeshConfig, MeshGrid } from '../types'
+import type { GradientMapConfig, MeshConfig, MeshGrid, RenderMode } from '../types'
 import { canvasToUv, canvasToSphereNormal } from './mesh'
 import { applySphereLightingRgb } from './sphereLighting'
 import {
@@ -7,17 +7,37 @@ import {
   LUT_SIZE,
   sampleGradientLut,
 } from './gradientLut'
+import type { ShapeDefinition, ShapeFit } from './shapeDomain'
+import { buildShapeMask, pixelToUv, scaleShapeForSize, sphereLayout } from './shapeDomain'
+import { DEFAULT_SVG_SHAPE_URL } from '../config/defaults'
 
 // ---------------------------------------------------------------------------
-// UV cache (per canvas size)
+// UV cache (per canvas size + mode)
 // ---------------------------------------------------------------------------
 
-let uvCacheSize = -1
+let uvCacheKey = ''
 let uCache: Float32Array | null = null
 let vCache: Float32Array | null = null
+let maskCacheKey = ''
+let maskCacheArr: Uint8Array | null = null
 
-function getUvCache(size: number, cx: number, cy: number, radius: number) {
-  if (uvCacheSize === size && uCache && vCache) {
+function uvCacheId(
+  size: number,
+  mode: RenderMode,
+  cx: number,
+  cy: number,
+  radius: number,
+  fit?: ShapeFit,
+): string {
+  if (mode === 'svg' && fit) {
+    return `svg:${size}:${fit.bx}:${fit.by}:${fit.bw}:${fit.bh}`
+  }
+  return `sphere:${size}:${cx}:${cy}:${radius}`
+}
+
+function getSphereUvCache(size: number, cx: number, cy: number, radius: number) {
+  const key = uvCacheId(size, 'sphere', cx, cy, radius)
+  if (uvCacheKey === key && uCache && vCache) {
     return { u: uCache, v: vCache }
   }
 
@@ -34,14 +54,44 @@ function getUvCache(size: number, cx: number, cy: number, radius: number) {
     }
   }
 
-  uvCacheSize = size
+  uvCacheKey = key
+  return { u: uCache, v: vCache }
+}
+
+function getSvgUvCache(size: number, fit: ShapeFit, mask: Uint8Array) {
+  const key = uvCacheId(size, 'svg', 0, 0, 0, fit)
+  if (uvCacheKey === key && uCache && vCache) {
+    return { u: uCache, v: vCache }
+  }
+
+  const n = size * size
+  uCache = new Float32Array(n)
+  vCache = new Float32Array(n)
+
+  for (let py = 0; py < size; py++) {
+    for (let px = 0; px < size; px++) {
+      const idx = py * size + px
+      if (!mask[idx]) {
+        uCache[idx] = 0
+        vCache[idx] = 0
+        continue
+      }
+      const { u, v } = pixelToUv(px, py, fit)
+      uCache[idx] = u
+      vCache[idx] = v
+    }
+  }
+
+  uvCacheKey = key
   return { u: uCache, v: vCache }
 }
 
 export function invalidateUvCache(): void {
-  uvCacheSize = -1
+  uvCacheKey = ''
   uCache = null
   vCache = null
+  maskCacheKey = ''
+  maskCacheArr = null
 }
 
 // ---------------------------------------------------------------------------
@@ -80,15 +130,33 @@ export interface RenderPayload {
   cols: number
   rows: number
   colors: Float32Array
+  renderMode: RenderMode
   sphereShading: number
   sphereLightness: number
   sphereShininess: number
   gradientEnabled: boolean
   gradientOffset: number
   gradientLut: Uint8Array | null
+  /** SVG mode */
+  mask?: Uint8Array
+  fit?: ShapeFit
+  blurCx?: number
+  blurCy?: number
 }
 
-export function buildRenderPayload(grid: MeshGrid, config: MeshConfig, size: number): RenderPayload {
+export function buildRenderPayload(
+  grid: MeshGrid,
+  config: MeshConfig,
+  size: number,
+  shape?: ShapeDefinition | null,
+  shapeUrl = DEFAULT_SVG_SHAPE_URL,
+): RenderPayload {
+  const svgShape =
+    config.renderMode === 'svg' && shape
+      ? size === config.canvasSize
+        ? shape
+        : scaleShapeForSize(shape, size)
+      : null
   const { cols, rows, points } = grid
   const colors = new Float32Array(cols * rows * 3)
 
@@ -104,11 +172,12 @@ export function buildRenderPayload(grid: MeshGrid, config: MeshConfig, size: num
 
   const lut = getGradientLut(config.gradientMap)
 
-  return {
+  const base: RenderPayload = {
     size,
     cols,
     rows,
     colors,
+    renderMode: config.renderMode,
     sphereShading: config.sphereShading,
     sphereLightness: config.sphereLightness,
     sphereShininess: config.sphereShininess,
@@ -116,6 +185,16 @@ export function buildRenderPayload(grid: MeshGrid, config: MeshConfig, size: num
     gradientOffset: config.gradientMap.offset,
     gradientLut: lut ? new Uint8Array(lut) : null,
   }
+
+  if (svgShape) {
+    const mask = buildShapeMask(size, svgShape, shapeUrl)
+    base.mask = mask
+    base.fit = { ...svgShape.fit }
+    base.blurCx = svgShape.cx
+    base.blurCy = svgShape.cy
+  }
+
+  return base
 }
 
 // ---------------------------------------------------------------------------
@@ -166,26 +245,73 @@ function sampleBilinear(
 /** Write rendered pixels into `data` (RGBA, length = size² × 4). */
 export function renderPixelsFused(
   data: Uint8ClampedArray,
-  size: number,
-  cols: number,
-  rows: number,
-  colors: Float32Array,
-  sphereShading: number,
-  sphereLightness: number,
-  sphereShininess: number,
-  gradientEnabled: boolean,
-  gradientOffset: number,
-  gradientLut: Uint8Array | null,
+  payload: RenderPayload,
   useUvCache: boolean,
 ): void {
-  const cx = size / 2
-  const cy = size / 2
-  const radius = size * 0.46
-  const radius2 = radius * radius
-
-  const uv = useUvCache ? getUvCache(size, cx, cy, radius) : null
+  const {
+    size,
+    cols,
+    rows,
+    colors,
+    renderMode,
+    sphereShading,
+    sphereLightness,
+    sphereShininess,
+    gradientEnabled,
+    gradientOffset,
+    gradientLut,
+    mask,
+    fit,
+  } = payload
 
   const lutOut = { r: 0, g: 0, b: 0 }
+  const isSvg = renderMode === 'svg' && mask && fit
+
+  if (isSvg) {
+    const uv = useUvCache ? getSvgUvCache(size, fit, mask) : null
+
+    for (let py = 0; py < size; py++) {
+      for (let px = 0; px < size; px++) {
+        const pidx = py * size + px
+        if (!mask[pidx]) continue
+
+        let u: number
+        let v: number
+        if (uv) {
+          u = uv.u[pidx]
+          v = uv.v[pidx]
+        } else {
+          const uvPair = pixelToUv(px, py, fit)
+          u = uvPair.u
+          v = uvPair.v
+        }
+
+        const mesh = sampleBilinear(colors, cols, rows, u, v)
+        let r = mesh.r
+        let g = mesh.g
+        let b = mesh.b
+
+        if (gradientEnabled && gradientLut) {
+          const luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+          const mapT = clamp01(luma + gradientOffset * (u * 2 - 1))
+          sampleGradientLut(gradientLut, mapT, lutOut)
+          r = lutOut.r
+          g = lutOut.g
+          b = lutOut.b
+        }
+
+        const idx = pidx * 4
+        data[idx] = r + 0.5 | 0
+        data[idx + 1] = g + 0.5 | 0
+        data[idx + 2] = b + 0.5 | 0
+        data[idx + 3] = 255
+      }
+    }
+    return
+  }
+
+  const { cx, cy, radius, radius2 } = sphereLayout(size)
+  const uv = useUvCache ? getSphereUvCache(size, cx, cy, radius) : null
 
   for (let py = 0; py < size; py++) {
     for (let px = 0; px < size; px++) {
@@ -249,42 +375,24 @@ export function renderMeshPixels(
   size: number,
   grid: MeshGrid,
   config: MeshConfig,
+  shape?: ShapeDefinition | null,
+  shapeUrl = DEFAULT_SVG_SHAPE_URL,
 ): void {
-  const payload = buildRenderPayload(grid, config, size)
-  renderPixelsFused(
-    data,
-    payload.size,
-    payload.cols,
-    payload.rows,
-    payload.colors,
-    payload.sphereShading,
-    payload.sphereLightness,
-    payload.sphereShininess,
-    payload.gradientEnabled,
-    payload.gradientOffset,
-    payload.gradientLut,
-    true,
-  )
+  const svgShape =
+    config.renderMode === 'svg' && shape
+      ? size === config.canvasSize
+        ? shape
+        : scaleShapeForSize(shape, size)
+      : null
+  const payload = buildRenderPayload(grid, config, size, svgShape ?? shape, shapeUrl)
+  renderPixelsFused(data, payload, true)
 }
 
 /** Render from worker payload (no UV cache — fresh arrays per export size). */
 export function renderPayloadPixels(payload: RenderPayload): Uint8ClampedArray {
   const { size } = payload
   const data = new Uint8ClampedArray(size * size * 4)
-  renderPixelsFused(
-    data,
-    payload.size,
-    payload.cols,
-    payload.rows,
-    payload.colors,
-    payload.sphereShading,
-    payload.sphereLightness,
-    payload.sphereShininess,
-    payload.gradientEnabled,
-    payload.gradientOffset,
-    payload.gradientLut,
-    false,
-  )
+  renderPixelsFused(data, payload, false)
   return data
 }
 

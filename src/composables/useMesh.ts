@@ -1,37 +1,29 @@
-import { ref, reactive, watch, readonly, computed } from 'vue'
-import type { MeshConfig, MeshGrid, MeshPoint, Color, ExportMode } from '../types'
+import { ref, reactive, watch, readonly, computed, onMounted } from 'vue'
+import type { MeshConfig, MeshGrid, MeshPoint, Color, ExportMode, RenderMode } from '../types'
 import type { GradientRandomizeOptions } from '../utils/color'
+import { buildRandomGradientMap, addStopAt, moveStop, removeStop } from '../utils/color'
 import {
   DEFAULT_PALETTE,
   DEFAULT_GRADIENT_MAP,
-  buildRandomGradientMap,
-  addStopAt,
-  moveStop,
-  removeStop,
-} from '../utils/color'
+  DEFAULT_GRADIENT_RANDOMIZE,
+  DEFAULT_MESH_CONFIG,
+  DEFAULT_SVG_SHAPE_URL,
+} from '../config/defaults'
 import { setSegmentMidpoint, syncMidpoints } from '../utils/gradientMidpoint'
 import { buildMeshGrid, rerandomizeGrid } from '../utils/mesh'
-import { exportRasterSVG, exportVectorSVG, exportPNG, downloadFile } from '../utils/export'
-
-// ---------------------------------------------------------------------------
-// Default config
-// ---------------------------------------------------------------------------
-
-const DEFAULT_CONFIG: MeshConfig = {
-  cols: 5,
-  rows: 5,
-  noiseScale: 1.4,
-  noiseSeed: 42,
-  noiseOctaves: 3,
-  sphereShading: 0,
-  sphereLightness: 0,
-  sphereShininess: 0,
-  colorContrast: 0.55,
-  palette: DEFAULT_PALETTE,
-  gradientMap: DEFAULT_GRADIENT_MAP,
-  blur: { gaussian: 0, motion: 0, motionAxis: 'horizontal', rotation: 0, grain: 0.1 },
-  canvasSize: 600,
-}
+import {
+  exportRasterSVG,
+  exportVectorSVG,
+  exportPNG,
+  downloadFile,
+  getExportFilename,
+} from '../utils/export'
+import { invalidateUvCache } from '../utils/renderCore'
+import {
+  invalidateShapeMaskCache,
+  loadSvgShape,
+  type ShapeDefinition,
+} from '../utils/shapeDomain'
 
 // ---------------------------------------------------------------------------
 // State
@@ -39,7 +31,7 @@ const DEFAULT_CONFIG: MeshConfig = {
 
 export function useMesh() {
   const config = reactive<MeshConfig>({
-    ...DEFAULT_CONFIG,
+    ...DEFAULT_MESH_CONFIG,
     palette: DEFAULT_PALETTE,
     gradientMap: {
       enabled: DEFAULT_GRADIENT_MAP.enabled,
@@ -50,7 +42,7 @@ export function useMesh() {
         color: { ...s.color },
       })),
     },
-    blur: { ...DEFAULT_CONFIG.blur },
+    blur: { ...DEFAULT_MESH_CONFIG.blur },
   })
 
   // The current mesh grid — rebuilt whenever config changes
@@ -63,11 +55,11 @@ export function useMesh() {
   const isRendering = ref(false)
   const exportMode = ref<ExportMode | null>(null)
 
-  const gradientRandomize = reactive({
-    reds: true,
-    greens: true,
-    blues: true,
-  })
+  const gradientRandomize = reactive({ ...DEFAULT_GRADIENT_RANDOMIZE })
+
+  const shapeDefinition = ref<ShapeDefinition | null>(null)
+  const shapeLoadError = ref<string | null>(null)
+  let shapeLoading: Promise<void> | null = null
 
   const renderingLabel = computed(() => {
     switch (exportMode.value) {
@@ -96,9 +88,49 @@ export function useMesh() {
   // Grid rebuild
   // ---------------------------------------------------------------------------
 
+  async function ensureShapeLoaded(): Promise<ShapeDefinition | null> {
+    if (config.renderMode !== 'svg') return null
+    if (shapeDefinition.value) return shapeDefinition.value
+    if (shapeLoading) {
+      await shapeLoading
+      return shapeDefinition.value
+    }
+    shapeLoading = (async () => {
+      try {
+        shapeLoadError.value = null
+        shapeDefinition.value = await loadSvgShape(
+          DEFAULT_SVG_SHAPE_URL,
+          config.canvasSize,
+        )
+        invalidateShapeMaskCache()
+      } catch (e) {
+        shapeLoadError.value =
+          e instanceof Error ? e.message : 'Failed to load shape SVG'
+        shapeDefinition.value = null
+      } finally {
+        shapeLoading = null
+      }
+    })()
+    await shapeLoading
+    return shapeDefinition.value
+  }
+
   function rebuildGrid(preservePins = true) {
     const prev = preservePins ? grid.value : undefined
-    grid.value = buildMeshGrid(config, prev)
+    const shape = config.renderMode === 'svg' ? shapeDefinition.value : null
+    grid.value = buildMeshGrid(config, prev, shape)
+  }
+
+  async function setRenderMode(mode: RenderMode) {
+    if (config.renderMode === mode) return
+    config.renderMode = mode
+    invalidateUvCache()
+    invalidateShapeMaskCache()
+    if (mode === 'svg') {
+      await ensureShapeLoaded()
+    }
+    rebuildGrid(false)
+    bumpRender()
   }
 
   /** Re-randomize only the noise seed, keeping pinned colors. */
@@ -266,24 +298,28 @@ export function useMesh() {
   // ---------------------------------------------------------------------------
 
   function exportAs(mode: ExportMode = 'raster', exportSize: number = 1200) {
-    const timestamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
-
     exportMode.value = mode
     isRendering.value = true
 
     // Defer heavy work so the loading indicator has time to paint
     setTimeout(async () => {
       try {
+        let shape =
+          config.renderMode === 'svg' ? await ensureShapeLoaded() : null
+        if (config.renderMode === 'svg' && !shape) {
+          console.error('SVG shape not loaded — export aborted')
+          return
+        }
+
         if (mode === 'png') {
-          await exportPNG(grid.value, config, exportSize)
+          await exportPNG(grid.value, config, exportSize, shape)
         } else if (mode === 'raster') {
-          const svg = await exportRasterSVG(grid.value, config, exportSize)
-          downloadFile(svg, `orbmaker-${timestamp}.svg`)
+          const svg = await exportRasterSVG(grid.value, config, exportSize, shape)
+          downloadFile(svg, getExportFilename('raster', config.renderMode))
         } else {
-          // Vector SVG: subdivisions scale with size for smoother output at 4K
           const subs = exportSize >= 2000 ? 6 : 4
-          const svg = exportVectorSVG(grid.value, config, subs, exportSize)
-          downloadFile(svg, `orbmaker-vector-${timestamp}.svg`)
+          const svg = exportVectorSVG(grid.value, config, subs, exportSize, shape)
+          downloadFile(svg, getExportFilename('vector', config.renderMode))
         }
       } finally {
         isRendering.value = false
@@ -296,6 +332,12 @@ export function useMesh() {
   // Exposed
   // ---------------------------------------------------------------------------
 
+  onMounted(() => {
+    if (config.renderMode === 'svg') {
+      ensureShapeLoaded().then(() => rebuildGrid(false))
+    }
+  })
+
   return {
     config,
     grid: readonly(grid),
@@ -304,7 +346,10 @@ export function useMesh() {
     renderingLabel,
     gradientRandomize,
     renderVersion: readonly(renderVersion),
+    shapeDefinition: readonly(shapeDefinition),
+    shapeLoadError: readonly(shapeLoadError),
     // Actions
+    setRenderMode,
     randomize,
     reset,
     selectPoint,

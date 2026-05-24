@@ -26,10 +26,16 @@ export function renderInWorker(
   grid: MeshGrid,
   config: MeshConfig,
   size: number,
+  shape?: import('./shapeDomain').ShapeDefinition | null,
+  shapeUrl?: string,
 ): Promise<ImageData> {
   const w = getWorker()
   const id = ++requestId
-  const payload = buildRenderPayload(grid, config, size)
+  const payload = buildRenderPayload(grid, config, size, shape, shapeUrl)
+  const maskForBlur = payload.mask ? new Uint8Array(payload.mask) : undefined
+  const payloadForBlur = maskForBlur
+    ? { ...payload, mask: maskForBlur }
+    : payload
 
   return new Promise((resolve, reject) => {
     const onMessage = (event: MessageEvent<WorkerRenderResponse>) => {
@@ -39,7 +45,7 @@ export function renderInWorker(
       w.removeEventListener('error', onError)
 
       const data = new Uint8ClampedArray(msg.buffer)
-      finishImageData(data, msg.width, config)
+      finishImageData(data, msg.width, config, payloadForBlur)
       resolve(new ImageData(data, msg.width, msg.height))
     }
 
@@ -60,6 +66,7 @@ export function renderInWorker(
 
     const transfer: Transferable[] = [payload.colors.buffer]
     if (payload.gradientLut) transfer.push(payload.gradientLut.buffer)
+    if (payload.mask) transfer.push(payload.mask.buffer)
 
     w.postMessage(request, transfer)
   })

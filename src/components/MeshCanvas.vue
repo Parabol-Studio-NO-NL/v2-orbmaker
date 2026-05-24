@@ -3,12 +3,15 @@ import { ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import type { MeshGrid, MeshConfig, Color } from '../types'
 import { renderMeshToCanvas } from '../utils/render'
 import { uvToCanvas } from '../utils/mesh'
+import type { ShapeDefinition } from '../utils/shapeDomain'
+import { uvToCanvasBbox } from '../utils/shapeDomain'
 
 const props = defineProps<{
   grid: MeshGrid
   config: MeshConfig
   selectedPoint: { row: number; col: number } | null
   renderVersion: number
+  shapeDefinition?: ShapeDefinition | null
 }>()
 
 const emit = defineEmits<{
@@ -33,7 +36,9 @@ function scheduleRender() {
 function paintColorLayer() {
   const canvas = canvasRef.value
   if (!canvas) return
-  renderMeshToCanvas(canvas, props.grid, props.config)
+  const shape =
+    props.config.renderMode === 'svg' ? props.shapeDefinition ?? null : null
+  renderMeshToCanvas(canvas, props.grid, props.config, shape)
 }
 
 function paintMeshOverlay() {
@@ -47,11 +52,17 @@ function paintMeshOverlay() {
 
   if (!showMeshLines.value) return
 
-  const { grid } = props
+  const { grid, config } = props
   const cx = size / 2
   const cy = size / 2
   const radius = size * 0.46
-  const curveSteps = 8
+  const curveSteps = config.renderMode === 'sphere' ? 8 : 1
+  const isSvg = config.renderMode === 'svg' && props.shapeDefinition
+
+  function mapUv(u: number, v: number) {
+    if (isSvg) return uvToCanvasBbox(u, v, props.shapeDefinition!.fit)
+    return uvToCanvas(u, v, cx, cy, radius)
+  }
 
   const colU = (col: number) =>
     grid.cols === 1 ? 0.5 : col / (grid.cols - 1)
@@ -72,7 +83,7 @@ function paintMeshOverlay() {
       for (let s = 0; s <= curveSteps; s++) {
         const t = s / curveSteps
         const u = u0 + (u1 - u0) * t
-        const { x, y } = uvToCanvas(u, v, cx, cy, radius)
+        const { x, y } = mapUv(u, v)
         if (!started) {
           ctx.moveTo(x, y)
           started = true
@@ -94,7 +105,7 @@ function paintMeshOverlay() {
       for (let s = 0; s <= curveSteps; s++) {
         const t = s / curveSteps
         const v = v0 + (v1 - v0) * t
-        const { x, y } = uvToCanvas(u, v, cx, cy, radius)
+        const { x, y } = mapUv(u, v)
         if (!started) {
           ctx.moveTo(x, y)
           started = true
@@ -119,6 +130,8 @@ onMounted(() => {
 watch(
   () => [
     props.grid,
+    props.config.renderMode,
+    props.shapeDefinition,
     props.config.sphereShading,
     props.config.sphereLightness,
     props.config.sphereShininess,
@@ -155,12 +168,13 @@ function onCanvasClick(e: MouseEvent) {
   const py = (e.clientY - rect.top) * scaleY
 
   const size = props.config.canvasSize
-  const cx = size / 2
-  const cy = size / 2
   const radius = size * 0.46
 
   let closest: { row: number; col: number; dist: number } | null = null
-  const THRESHOLD = radius * 0.1
+  const THRESHOLD =
+    props.config.renderMode === 'svg' && props.shapeDefinition
+      ? Math.min(props.shapeDefinition.fit.bw, props.shapeDefinition.fit.bh) * 0.08
+      : radius * 0.1
 
   for (let row = 0; row < props.grid.rows; row++) {
     for (let col = 0; col < props.grid.cols; col++) {

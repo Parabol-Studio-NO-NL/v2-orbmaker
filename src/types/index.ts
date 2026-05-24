@@ -66,6 +66,8 @@ export interface MeshPalette {
   hues: [Color, Color, Color]
 }
 
+export type RenderMode = 'sphere' | 'svg'
+
 export interface MeshConfig {
   /** Number of vertical grid lines (columns) */
   cols: number
@@ -94,6 +96,8 @@ export interface MeshConfig {
   blur: BlurConfig
   /** Rendered canvas size in logical pixels */
   canvasSize: number
+  /** Sphere orb vs bundled SVG silhouette */
+  renderMode: RenderMode
 }
 
 export type ExportMode = 'raster' | 'vector' | 'png'

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import type { MeshConfig, MeshGrid, Color, ExportMode } from '../types'
+import type { MeshConfig, MeshGrid, Color, ExportMode, RenderMode } from '../types'
 import ColorSwatch from './ColorSwatch.vue'
 import GradientMapEditor from './GradientMapEditor.vue'
 
@@ -10,6 +10,7 @@ const props = defineProps<{
   selectedPoint: { row: number; col: number } | null
   isRendering: boolean
   gradientRandomize: { reds: boolean; greens: boolean; blues: boolean }
+  shapeLoadError?: string | null
 }>()
 
 const emit = defineEmits<{
@@ -41,6 +42,7 @@ const emit = defineEmits<{
   'point:color': [color: Color]
   'point:unpin': []
   'export': [mode: ExportMode, size: number]
+  'update:renderMode': [mode: RenderMode]
 }>()
 
 // ---------------------------------------------------------------------------
@@ -79,6 +81,30 @@ function numInput(key: 'cols' | 'rows' | 'noiseScale' | 'noiseSeed' | 'noiseOcta
       <span class="panel-title">Controls</span>
     </div>
 
+    <!-- ── Shape mode ── -->
+    <section class="panel-section">
+      <h3 class="section-title">Shape</h3>
+      <div class="motion-axis-toggle">
+        <button
+          type="button"
+          class="axis-btn"
+          :class="{ 'axis-btn--active': config.renderMode === 'sphere' }"
+          @click="emit('update:renderMode', 'sphere')"
+        >
+          Orb
+        </button>
+        <button
+          type="button"
+          class="axis-btn"
+          :class="{ 'axis-btn--active': config.renderMode === 'svg' }"
+          @click="emit('update:renderMode', 'svg')"
+        >
+          v2_ Logotype
+        </button>
+      </div>
+      <p v-if="shapeLoadError" class="export-hint export-hint--warn">{{ shapeLoadError }}</p>
+    </section>
+
     <!-- ── Mesh density ── -->
     <section class="panel-section">
       <h3 class="section-title">Mesh Density</h3>
@@ -89,7 +115,7 @@ function numInput(key: 'cols' | 'rows' | 'noiseScale' | 'noiseSeed' | 'noiseOcta
           <span class="control-value">{{ config.cols }}</span>
         </label>
         <input
-          type="range" min="2" max="30" step="1"
+          type="range" min="2" max="50" step="1"
           :value="config.cols"
           class="slider"
           @input="emit('update:cols', Number(($event.target as HTMLInputElement).value))"
@@ -102,7 +128,7 @@ function numInput(key: 'cols' | 'rows' | 'noiseScale' | 'noiseSeed' | 'noiseOcta
           <span class="control-value">{{ config.rows }}</span>
         </label>
         <input
-          type="range" min="2" max="30" step="1"
+          type="range" min="2" max="50" step="1"
           :value="config.rows"
           class="slider"
           @input="emit('update:rows', Number(($event.target as HTMLInputElement).value))"
@@ -156,8 +182,14 @@ function numInput(key: 'cols' | 'rows' | 'noiseScale' | 'noiseSeed' | 'noiseOcta
     </section>
 
     <!-- ── Lighting & appearance ── -->
-    <section class="panel-section">
+    <section
+      class="panel-section"
+      :class="{ 'panel-section--disabled': config.renderMode === 'svg' }"
+    >
       <h3 class="section-title">Lighting</h3>
+      <p v-if="config.renderMode === 'svg'" class="export-hint">
+        Lighting applies in Orb mode only.
+      </p>
       <div class="control-row">
         <label class="control-label">
           Shading
@@ -167,6 +199,7 @@ function numInput(key: 'cols' | 'rows' | 'noiseScale' | 'noiseSeed' | 'noiseOcta
           type="range" min="0" max="1" step="0.02"
           :value="config.sphereShading"
           class="slider"
+          :disabled="config.renderMode === 'svg'"
           @input="emit('update:sphereShading', Number(($event.target as HTMLInputElement).value))"
         />
       </div>
@@ -179,6 +212,7 @@ function numInput(key: 'cols' | 'rows' | 'noiseScale' | 'noiseSeed' | 'noiseOcta
           type="range" min="0" max="1" step="0.02"
           :value="config.sphereLightness"
           class="slider"
+          :disabled="config.renderMode === 'svg'"
           @input="emit('update:sphereLightness', Number(($event.target as HTMLInputElement).value))"
         />
       </div>
@@ -191,6 +225,7 @@ function numInput(key: 'cols' | 'rows' | 'noiseScale' | 'noiseSeed' | 'noiseOcta
           type="range" min="0" max="1" step="0.02"
           :value="config.sphereShininess"
           class="slider"
+          :disabled="config.renderMode === 'svg'"
           @input="emit('update:sphereShininess', Number(($event.target as HTMLInputElement).value))"
         />
       </div>
@@ -796,6 +831,11 @@ function numInput(key: 'cols' | 'rows' | 'noiseScale' | 'noiseSeed' | 'noiseOcta
   background: rgba(255, 255, 255, 0.1);
   color: rgba(255, 255, 255, 0.9);
   border-color: rgba(255, 255, 255, 0.22);
+}
+
+.panel-section--disabled .slider:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 
 .res-toggle {

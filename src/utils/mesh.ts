@@ -1,6 +1,8 @@
-import type { MeshConfig, MeshGrid, MeshPoint, Color } from '../types'
+import type { MeshConfig, MeshGrid, MeshPoint, Color, RenderMode } from '../types'
 import { sampleWarpedNoise, sampleNoise } from './noise'
 import { snapToNearestPaletteColor, applyContrast, rgb } from './color'
+import type { ShapeDefinition } from './shapeDomain'
+import { uvToCanvasBbox } from './shapeDomain'
 
 // ---------------------------------------------------------------------------
 // Grid generation
@@ -17,8 +19,9 @@ import { snapToNearestPaletteColor, applyContrast, rgb } from './color'
 export function buildMeshGrid(
   config: MeshConfig,
   existingGrid?: MeshGrid,
+  shape?: ShapeDefinition | null,
 ): MeshGrid {
-  const { cols, rows, canvasSize } = config
+  const { cols, rows, canvasSize, renderMode } = config
 
   const cx = canvasSize / 2
   const cy = canvasSize / 2
@@ -33,7 +36,10 @@ export function buildMeshGrid(
       const u = cols === 1 ? 0.5 : col / (cols - 1)
       const v = rows === 1 ? 0.5 : row / (rows - 1)
 
-      const { x, y } = uvToCanvas(u, v, cx, cy, radius)
+      const { x, y } =
+        renderMode === 'svg' && shape
+          ? uvToCanvasBbox(u, v, shape.fit)
+          : uvToCanvas(u, v, cx, cy, radius)
 
       const existing = existingGrid?.points[row]?.[col]
       if (existing?.pinned) {
@@ -233,10 +239,42 @@ function gridUv(col: number, row: number, cols: number, rows: number): { u: numb
   }
 }
 
+function sampleGridAtUVFlat(u: number, v: number, grid: MeshGrid): Color {
+  const { cols, rows, points } = grid
+  const fCol = u * (cols - 1)
+  const fRow = v * (rows - 1)
+  const col0 = Math.floor(fCol)
+  const row0 = Math.floor(fRow)
+  const col1 = Math.min(col0 + 1, cols - 1)
+  const row1 = Math.min(row0 + 1, rows - 1)
+  const tu = fCol - col0
+  const tv = fRow - row0
+  const tl = points[row0][col0].color
+  const tr = points[row0][col1].color
+  const bl = points[row1][col0].color
+  const br = points[row1][col1].color
+  const r =
+    (tl.r * (1 - tu) + tr.r * tu) * (1 - tv) + (bl.r * (1 - tu) + br.r * tu) * tv
+  const g =
+    (tl.g * (1 - tu) + tr.g * tu) * (1 - tv) + (bl.g * (1 - tu) + br.g * tu) * tv
+  const b =
+    (tl.b * (1 - tu) + tr.b * tu) * (1 - tv) + (bl.b * (1 - tu) + br.b * tu) * tv
+  const a =
+    (tl.a * (1 - tu) + tr.a * tu) * (1 - tv) + (bl.a * (1 - tu) + br.a * tu) * tv
+  return rgb(r, g, b, a)
+}
+
 /**
- * Bilinear color sample on the sphere patch (stereographic UV + nlerp weights).
+ * Bilinear color sample — spherical nlerp in sphere mode, flat in svg mode.
  */
-export function sampleGridAtUV(u: number, v: number, grid: MeshGrid): Color {
+export function sampleGridAtUV(
+  u: number,
+  v: number,
+  grid: MeshGrid,
+  renderMode: RenderMode = 'sphere',
+): Color {
+  if (renderMode === 'svg') return sampleGridAtUVFlat(u, v, grid)
+
   const { cols, rows, points } = grid
 
   const fCol = u * (cols - 1)

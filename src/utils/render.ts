@@ -1,6 +1,9 @@
 import type { MeshConfig, MeshGrid } from '../types'
 import { applyPostProcessBlur } from './blur'
+import { DEFAULT_SVG_SHAPE_URL } from '../config/defaults'
 import { getGradientLut, invalidateUvCache, renderMeshPixels } from './renderCore'
+import type { ShapeDefinition } from './shapeDomain'
+import { buildShapeMask, scaleShapeForSize } from './shapeDomain'
 
 /**
  * Render a mesh gradient into any HTMLCanvasElement.
@@ -14,6 +17,8 @@ export function renderMeshToCanvas(
   canvas: HTMLCanvasElement,
   grid: MeshGrid,
   config: MeshConfig,
+  shape?: ShapeDefinition | null,
+  shapeUrl = DEFAULT_SVG_SHAPE_URL,
 ): void {
   const ctx = canvas.getContext('2d', { willReadFrequently: false })
   if (!ctx) return
@@ -25,9 +30,34 @@ export function renderMeshToCanvas(
 
   getGradientLut(config.gradientMap)
 
+  const svgShape =
+    config.renderMode === 'svg' && shape
+      ? size === config.canvasSize
+        ? shape
+        : scaleShapeForSize(shape, size)
+      : null
+
   const imageData = ctx.createImageData(size, size)
-  renderMeshPixels(imageData.data, size, grid, config)
-  applyPostProcessBlur(imageData.data, size, config.blur, config.noiseSeed)
+  renderMeshPixels(imageData.data, size, grid, config, svgShape ?? shape, shapeUrl)
+
+  let mask: Uint8Array | undefined
+  let blurCx: number | undefined
+  let blurCy: number | undefined
+  if (config.renderMode === 'svg' && svgShape) {
+    mask = buildShapeMask(size, svgShape, shapeUrl)
+    blurCx = svgShape.cx
+    blurCy = svgShape.cy
+  }
+
+  applyPostProcessBlur(
+    imageData.data,
+    size,
+    config.blur,
+    config.noiseSeed,
+    mask,
+    blurCx,
+    blurCy,
+  )
   ctx.putImageData(imageData, 0, 0)
 }
 
@@ -36,7 +66,20 @@ export function finishImageData(
   data: Uint8ClampedArray,
   size: number,
   config: MeshConfig,
+  payload?: import('./renderCore').RenderPayload,
 ): void {
+  if (payload?.renderMode === 'svg' && payload.mask) {
+    applyPostProcessBlur(
+      data,
+      size,
+      config.blur,
+      config.noiseSeed,
+      payload.mask,
+      payload.blurCx,
+      payload.blurCy,
+    )
+    return
+  }
   applyPostProcessBlur(data, size, config.blur, config.noiseSeed)
 }
 
@@ -48,12 +91,14 @@ export function createExportCanvas(
   grid: MeshGrid,
   config: MeshConfig,
   size: number,
+  shape?: ShapeDefinition | null,
+  shapeUrl = DEFAULT_SVG_SHAPE_URL,
 ): HTMLCanvasElement {
   invalidateUvCache()
   const canvas = document.createElement('canvas')
   canvas.width = size
   canvas.height = size
-  renderMeshToCanvas(canvas, grid, config)
+  renderMeshToCanvas(canvas, grid, config, shape, shapeUrl)
   invalidateUvCache()
   return canvas
 }
