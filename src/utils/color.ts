@@ -14,32 +14,11 @@ export function rgb(r: number, g: number, b: number, a = 255): Color {
 export const BLACK: Color = rgb(0, 0, 0)
 export const WHITE: Color = rgb(255, 255, 255)
 
-// Default palette: black, grey, white
-export const DEFAULT_PALETTE: MeshPalette = {
-  hues: [
-    rgb(0, 0, 0),
-    rgb(128, 128, 128),
-    rgb(255, 255, 255),
-  ],
-}
-
 let stopIdCounter = 0
 export function newStopId(): string {
   return `stop-${++stopIdCounter}`
 }
 
-export const DEFAULT_GRADIENT_MAP: GradientMapConfig = {
-  enabled: true,
-  offset: 0,
-  midpoints: {},
-  stops: [
-    { id: newStopId(), color: rgb(0, 0, 0), position: 0 },
-    { id: newStopId(), color: rgb(220, 38, 38), position: 0.25 },
-    { id: newStopId(), color: rgb(234, 179, 8), position: 0.5 },
-    { id: newStopId(), color: rgb(37, 99, 235), position: 0.75 },
-    { id: newStopId(), color: rgb(255, 255, 255), position: 1 },
-  ],
-}
 
 // ---------------------------------------------------------------------------
 // Conversion helpers

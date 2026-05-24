@@ -1,4 +1,5 @@
 import type { BlurConfig } from '../types'
+import { BLUR_RENDER_TUNING } from '../config/defaults'
 import { mulberry32 } from './noise'
 
 function buildSphereMask(
@@ -44,6 +45,75 @@ function sampleRgb(
   const y = Math.max(0, Math.min(size - 1, py))
   const i = (y * size + x) * 4
   return [src[i], src[i + 1], src[i + 2], src[i + 3]]
+}
+
+/** Deterministic per-pixel hash in [0, 1) — breaks aligned blur banding. */
+function pixelHash(x: number, y: number, seed: number): number {
+  let h = (x * 374761393 + y * 668265263 + seed * 1442695041) | 0
+  h = Math.imul(h ^ (h >>> 16), 0x7feb352d)
+  h = Math.imul(h ^ (h >>> 15), 0x846ca68b)
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296
+}
+
+/** Bilinear RGBA sample (mask-aware, renormalizes in-mask corners). */
+function sampleRgbBilinear(
+  src: Uint8ClampedArray,
+  size: number,
+  fx: number,
+  fy: number,
+  mask: Uint8Array,
+): [number, number, number, number] | null {
+  const x0 = Math.floor(fx)
+  const y0 = Math.floor(fy)
+  if (x0 < 0 || y0 < 0 || x0 >= size - 1 || y0 >= size - 1) {
+    const x = Math.max(0, Math.min(size - 1, Math.round(fx)))
+    const y = Math.max(0, Math.min(size - 1, Math.round(fy)))
+    const pi = y * size + x
+    if (!mask[pi]) return null
+    return sampleRgb(src, size, x, y)
+  }
+
+  const x1 = x0 + 1
+  const y1 = y0 + 1
+  const tx = fx - x0
+  const ty = fy - y0
+  const corners = [
+    { x: x0, y: y0, w: (1 - tx) * (1 - ty) },
+    { x: x1, y: y0, w: tx * (1 - ty) },
+    { x: x0, y: y1, w: (1 - tx) * ty },
+    { x: x1, y: y1, w: tx * ty },
+  ]
+
+  let r = 0
+  let g = 0
+  let b = 0
+  let a = 0
+  let wsum = 0
+
+  for (const c of corners) {
+    const pi = c.y * size + c.x
+    if (!mask[pi]) continue
+    const i = pi * 4
+    r += src[i] * c.w
+    g += src[i + 1] * c.w
+    b += src[i + 2] * c.w
+    a += src[i + 3] * c.w
+    wsum += c.w
+  }
+
+  if (wsum < 1e-6) return null
+  return [r / wsum, g / wsum, b / wsum, a / wsum]
+}
+
+function writeSample(
+  out: Uint8ClampedArray,
+  o: number,
+  sample: [number, number, number, number],
+): void {
+  out[o] = sample[0] + 0.5 | 0
+  out[o + 1] = sample[1] + 0.5 | 0
+  out[o + 2] = sample[2] + 0.5 | 0
+  out[o + 3] = sample[3] + 0.5 | 0
 }
 
 /** Separable Gaussian blur on RGBA; only pixels in mask are written. */
@@ -143,13 +213,15 @@ function motionBlur(
   lengthPx: number,
   angleDeg: number,
   mask: Uint8Array,
+  jitterSeed: number,
 ): Uint8ClampedArray {
   const out = new Uint8ClampedArray(src.length)
-  const steps = Math.max(2, Math.round(lengthPx))
+  const steps = Math.max(4, Math.round(lengthPx * 1.15))
   const rad = (angleDeg * Math.PI) / 180
   const dx = Math.cos(rad)
   const dy = Math.sin(rad)
-  const half = (steps - 1) / 2
+  const perpX = -dy
+  const perpY = dx
 
   for (let py = 0; py < size; py++) {
     for (let px = 0; px < size; px++) {
@@ -164,39 +236,37 @@ function motionBlur(
         continue
       }
 
+      const subJitter = (pixelHash(px, py, jitterSeed) - 0.5) * 0.65
       let r = 0
       let g = 0
       let b = 0
       let a = 0
-      let count = 0
+      let wsum = 0
 
       for (let s = 0; s < steps; s++) {
-        const t = s - half
-        const sx = px + dx * t
-        const sy = py + dy * t
-        const x = Math.round(sx)
-        const y = Math.round(sy)
-        if (x < 0 || x >= size || y < 0 || y >= size) continue
-        const si = y * size + x
-        if (!mask[si]) continue
-        const i = si * 4
-        r += src[i]
-        g += src[i + 1]
-        b += src[i + 2]
-        a += src[i + 3]
-        count++
+        const strat = (s + pixelHash(px, py, jitterSeed + s * 31)) / steps
+        const along = (strat - 0.5) * lengthPx
+        const across = (pixelHash(px, py, jitterSeed + s * 53) - 0.5) * subJitter
+        const sx = px + dx * along + perpX * across
+        const sy = py + dy * along + perpY * across
+        const sample = sampleRgbBilinear(src, size, sx, sy, mask)
+        if (!sample) continue
+
+        const wt = 1 - Math.abs(strat - 0.5) * 1.6
+        r += sample[0] * wt
+        g += sample[1] * wt
+        b += sample[2] * wt
+        a += sample[3] * wt
+        wsum += wt
       }
 
-      if (count === 0) {
+      if (wsum < 1e-6) {
         out[o] = src[o]
         out[o + 1] = src[o + 1]
         out[o + 2] = src[o + 2]
         out[o + 3] = src[o + 3]
       } else {
-        out[o] = r / count + 0.5 | 0
-        out[o + 1] = g / count + 0.5 | 0
-        out[o + 2] = b / count + 0.5 | 0
-        out[o + 3] = a / count + 0.5 | 0
+        writeSample(out, o, [r / wsum, g / wsum, b / wsum, a / wsum])
       }
     }
   }
@@ -204,7 +274,7 @@ function motionBlur(
   return out
 }
 
-/** Rotational blur — average samples along an arc around the sphere center. */
+/** Rotational blur — jittered arc samples around the sphere center. */
 function rotationalBlur(
   src: Uint8ClampedArray,
   size: number,
@@ -212,10 +282,12 @@ function rotationalBlur(
   mask: Uint8Array,
   cx: number,
   cy: number,
+  jitterSeed: number,
 ): Uint8ClampedArray {
   const out = new Uint8ClampedArray(src.length)
-  const angleSpan = strength * (Math.PI / 2.5)
-  const steps = Math.max(3, Math.round(strength * 28))
+  const t = BLUR_RENDER_TUNING.rotational
+  const angleSpan = strength * t.angleSpanAtFull
+  const steps = Math.max(t.minSampleSteps, Math.round(strength * t.sampleStepsScale))
 
   for (let py = 0; py < size; py++) {
     for (let px = 0; px < size; px++) {
@@ -243,38 +315,40 @@ function rotationalBlur(
       }
 
       const baseAngle = Math.atan2(dy, dx)
+      const arcOffset = (pixelHash(px, py, jitterSeed + 7) - 0.5) * angleSpan * t.arcOffsetJitter
+      const radiusJitter = (pixelHash(px, py, jitterSeed + 11) - 0.5) * t.radiusJitterPx
+
       let r = 0
       let g = 0
       let b = 0
       let a = 0
-      let count = 0
+      let wsum = 0
 
       for (let s = 0; s < steps; s++) {
-        const t = steps === 1 ? 0 : (s / (steps - 1) - 0.5) * 2
-        const theta = baseAngle + t * (angleSpan * 0.5)
-        const x = Math.round(cx + dist * Math.cos(theta))
-        const y = Math.round(cy + dist * Math.sin(theta))
-        if (x < 0 || x >= size || y < 0 || y >= size) continue
-        const si = y * size + x
-        if (!mask[si]) continue
-        const i = si * 4
-        r += src[i]
-        g += src[i + 1]
-        b += src[i + 2]
-        a += src[i + 3]
-        count++
+        const strat = (s + pixelHash(px, py, jitterSeed + s * 47)) / steps
+        const delta = (strat - 0.5) * angleSpan
+        const theta = baseAngle + arcOffset + delta
+        const rSample = dist + radiusJitter
+        const sx = cx + rSample * Math.cos(theta)
+        const sy = cy + rSample * Math.sin(theta)
+        const sample = sampleRgbBilinear(src, size, sx, sy, mask)
+        if (!sample) continue
+
+        const wt = 1 - Math.abs(strat - 0.5) * t.weightFalloff
+        r += sample[0] * wt
+        g += sample[1] * wt
+        b += sample[2] * wt
+        a += sample[3] * wt
+        wsum += wt
       }
 
-      if (count === 0) {
+      if (wsum < 1e-6) {
         out[o] = src[o]
         out[o + 1] = src[o + 1]
         out[o + 2] = src[o + 2]
         out[o + 3] = src[o + 3]
       } else {
-        out[o] = r / count + 0.5 | 0
-        out[o + 1] = g / count + 0.5 | 0
-        out[o + 2] = b / count + 0.5 | 0
-        out[o + 3] = a / count + 0.5 | 0
+        writeSample(out, o, [r / wsum, g / wsum, b / wsum, a / wsum])
       }
     }
   }
@@ -304,43 +378,54 @@ function applyFilmGrain(
   }
 }
 
-/** Apply blur and grain post-processing on rendered sphere ImageData. */
+/** Apply blur and grain post-processing on rendered ImageData. */
 export function applyPostProcessBlur(
   data: Uint8ClampedArray,
   size: number,
   blur: BlurConfig,
   noiseSeed = 0,
+  mask?: Uint8Array,
+  blurCx?: number,
+  blurCy?: number,
 ): void {
-  const gaussPx = blur.gaussian * size * 0.06
-  const motionPx = blur.motion * size * 0.2
-  const hasRotation = blur.rotation > 0.02
-  const hasBlur = gaussPx >= 0.5 || motionPx >= 2 || hasRotation
+  const gaussPx = blur.gaussian * size * BLUR_RENDER_TUNING.gaussianSizeScale
+  const motionPx = blur.motion * size * BLUR_RENDER_TUNING.motionSizeScale
+  const hasRotation = blur.rotation > BLUR_RENDER_TUNING.rotational.minStrength
+  const hasBlur =
+    gaussPx >= 0.5 || motionPx >= BLUR_RENDER_TUNING.motionMinPixels || hasRotation
   const hasGrain = blur.grain > 0
 
   if (!hasBlur && !hasGrain) return
 
-  const cx = size / 2
-  const cy = size / 2
+  const cx = blurCx ?? size / 2
+  const cy = blurCy ?? size / 2
   const radius2 = (size * 0.46) ** 2
-  const mask = buildSphereMask(size, cx, cy, radius2)
+  const effectiveMask = mask ?? buildSphereMask(size, size / 2, size / 2, radius2)
 
   let work = data
 
   if (gaussPx >= 0.5) {
-    work = gaussianBlur(work, size, gaussPx, mask)
+    work = gaussianBlur(work, size, gaussPx, effectiveMask)
   }
 
   if (motionPx >= 2) {
-    work = motionBlur(work, size, motionPx, motionAxisToAngle(blur.motionAxis), mask)
+    work = motionBlur(
+      work,
+      size,
+      motionPx,
+      motionAxisToAngle(blur.motionAxis),
+      effectiveMask,
+      noiseSeed + 12001,
+    )
   }
 
   if (hasRotation) {
-    work = rotationalBlur(work, size, blur.rotation, mask, cx, cy)
+    work = rotationalBlur(work, size, blur.rotation, effectiveMask, cx, cy, noiseSeed + 24002)
   }
 
   data.set(work)
 
   if (hasGrain) {
-    applyFilmGrain(data, size, blur.grain, noiseSeed, mask)
+    applyFilmGrain(data, size, blur.grain, noiseSeed, effectiveMask)
   }
 }
